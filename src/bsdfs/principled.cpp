@@ -45,12 +45,12 @@ The Principled BSDF (:monosp:`principled`)
    - |exposed|, |differentiable|, |discontinuous|
 
  * - eta
-   - |float|
+   - |texture| or |float|
    - Interior IOR/Exterior IOR
    - |exposed|, |differentiable|, |discontinuous|
 
  * - specular
-   - |float|
+   - |texture| or |float|
    - Controls the Fresnel reflection coefficient. This parameter has one to one
      correspondence with `eta`, so both of them can not be specified in xml.
      (Default:0.5)
@@ -218,22 +218,23 @@ public:
                   "\"%s\", either use \"eta\" or \"specular\" !");
         } else if (props.has_property("eta")) {
             m_eta_specular = true;
-            m_eta = props.get<float>("eta");
-            // m_eta = 1 is not plausible for transmission
-            dr::masked(m_eta, m_has_spec_trans && m_eta == 1) = 1.001f;
+            m_eta = props.texture<Texture>("eta");
+            if (m_eta->is_spatially_varying() && m_has_spec_trans) {
+              Throw(
+                  "Specular transmission is incompatible with a spatially "
+                  "varying index of refraction eta!");
+            }
         } else {
             m_eta_specular = false;
-            m_specular = props.get<float>("specular", 0.5f);
-            // zero specular is not plausible for transmission
-            dr::masked(m_specular, m_has_spec_trans && m_specular == 0.f) = 1e-3f;
-            m_eta = 2.0f * dr::rcp(1.0f - dr::sqrt(0.08f * m_specular)) - 1.0f;
+            m_specular = props.texture<Texture>("specular", 0.5f);
+            if (m_specular->is_spatially_varying() && m_has_spec_trans) {
+                Throw(
+                    "Specular transmission is incompatible with a spatially "
+                    "varying specular coefficient!");
+            }
         }
 
         initialize_lobes();
-
-        dr::make_opaque(m_eta);
-        if (!m_eta_specular)
-            dr::make_opaque(m_specular);
     }
 
     void initialize_lobes() {
@@ -277,9 +278,9 @@ public:
         callback->put_parameter("diffuse_reflectance_sampling_rate", m_diff_refl_srate, +ParamFlags::NonDifferentiable);
 
         if (m_eta_specular) //Only one of them traversed! (based on xml file)
-            callback->put_parameter("eta",      m_eta,      ParamFlags::Differentiable | ParamFlags::Discontinuous);
+            callback->put_object("eta",      m_eta.get(),      ParamFlags::Differentiable | ParamFlags::Discontinuous);
         else
-            callback->put_parameter("specular", m_specular, ParamFlags::Differentiable | ParamFlags::Discontinuous);
+            callback->put_object("specular", m_specular.get(), ParamFlags::Differentiable | ParamFlags::Discontinuous);
 
         callback->put_object("roughness",       m_roughness.get(),   ParamFlags::Differentiable | ParamFlags::Discontinuous);
         callback->put_object("base_color",      m_base_color.get(),  +ParamFlags::Differentiable);
@@ -310,23 +311,25 @@ public:
         if (string::contains(keys, "flatness"))
             m_has_flatness = true;
 
-        if (!m_eta_specular && string::contains(keys, "specular")) {
-            /* Specular=0 is corresponding to eta=1 which is not plausible
-               for transmission. */
-            dr::masked(m_specular, m_specular == 0.0f) = 1e-3f;
-            m_eta = 2.0f * dr::rcp(1.0f - dr::sqrt(0.08f * m_specular)) - 1.0f;
-        }
-
-        if (m_eta_specular && string::contains(keys, "eta")) {
-            // Eta = 1 is not plausible for transmission.
-            dr::masked(m_eta, m_eta == 1.0f) = 1.001f;
-        }
-
         initialize_lobes();
+    }
 
-        dr::make_opaque(m_eta);
-        if (!m_eta_specular)
-            dr::make_opaque(m_specular);
+    MI_INLINE
+    Float get_eta(const SurfaceInteraction3f &si, Mask active) const {
+        Float eta;
+        if (m_eta_specular) {
+            eta = m_eta->eval_1(si, active);
+            // Eta = 1 is not plausible for transmission.
+            dr::masked(eta, eta == 1.0f) = 1.001f;
+        }
+        else {
+            Float specular = m_specular->eval_1(si, active);
+            /* Specular=0 is corresponding to eta=1 which is not plausible
+            for transmission. */
+            dr::masked(specular, m_has_spec_trans && specular == 0.f) = 1e-3f;
+            eta = 2.0f * dr::rcp(1.0f - dr::sqrt(0.08f * specular)) - 1.0f;
+        }
+        return eta;
     }
 
     std::pair<BSDFSample3f, Spectrum>
@@ -364,8 +367,9 @@ public:
                 spec_distr.sample(dr::mulsign(si.wi, cos_theta_i), sample2));
 
         // Fresnel coefficient for the main specular.
+        Float eta = get_eta(si, active);
         auto [F_spec_dielectric, cos_theta_t, eta_it, eta_ti] =
-                fresnel(dr::dot(si.wi, m_spec), m_eta);
+                fresnel(dr::dot(si.wi, m_spec), eta);
 
         // If BSDF major lobe is turned off, we do not sample the inside
         // case.
@@ -523,11 +527,12 @@ public:
 
         // Masks for the side of the incident ray (wi.z<0)
         Mask front_side = cos_theta_i > 0.0f;
-        Float inv_eta   = dr::rcp(m_eta);
+        Float eta = get_eta(si, active);
+        Float inv_eta   = dr::rcp(eta);
 
         // Eta value w.r.t. ray instead of the object.
-        Float eta_path     = dr::select(front_side, m_eta, inv_eta);
-        Float inv_eta_path = dr::select(front_side, inv_eta, m_eta);
+        Float eta_path     = dr::select(front_side, eta, inv_eta);
+        Float inv_eta_path = dr::select(front_side, inv_eta, eta);
 
         // Main specular reflection and transmission lobe
         auto [ax, ay] = calc_dist_params(anisotropic, roughness,m_has_anisotropic);
@@ -542,7 +547,7 @@ public:
 
         // Dielectric Fresnel
         auto [F_spec_dielectric, cos_theta_t, eta_it, eta_ti] =
-                fresnel(dr::dot(si.wi, wh), m_eta);
+                fresnel(dr::dot(si.wi, wh), eta);
 
         Mask reflection_compatibilty =
                 mac_mic_compatibility(wh, si.wi, wo, cos_theta_i, true);
@@ -592,7 +597,7 @@ public:
             // Fresnel term
             UnpolarizedSpectrum F_principled = principled_fresnel(
                     F_spec_dielectric, metallic, spec_tint, base_color, lum,
-                    dr::dot(si.wi, wh), front_side, bsdf,m_eta,m_has_metallic,
+                    dr::dot(si.wi, wh), front_side, bsdf, eta, m_has_metallic,
                     m_has_spec_tint);
 
             // Adding the specular reflection component
@@ -624,7 +629,7 @@ public:
 
             // Clearcoat lobe uses the schlick approximation for Fresnel
             // term.
-            Float Fcc = calc_schlick<Float>(0.04f, dr::dot(si.wi, wh),m_eta);
+            Float Fcc = calc_schlick<Float>(0.04f, dr::dot(si.wi, wh),eta);
 
             /* Clearcoat lobe uses GTR1 distribution. Roughness is mapped
              * between 0.1 and 0.001. */
@@ -737,7 +742,8 @@ public:
         Mask front_side = cos_theta_i > 0.0f;
 
         // Eta w.r.t. light path.
-        Float eta_path    = dr::select(front_side, m_eta, dr::rcp(m_eta));
+        Float eta         = get_eta(si, active);
+        Float eta_path    = dr::select(front_side, eta, dr::rcp(eta));
         Float cos_theta_o = Frame3f::cos_theta(wo);
 
         Mask reflect = cos_theta_i * cos_theta_o > 0.0f;
@@ -756,7 +762,7 @@ public:
 
         // Dielectric Fresnel calculation
         auto [F_spec_dielectric, cos_theta_t, eta_it, eta_ti] =
-                fresnel(dr::dot(si.wi, wh), m_eta);
+                fresnel(dr::dot(si.wi, wh), eta);
 
         // Defining the probabilities
         Float prob_spec_reflect = dr::select(
@@ -876,8 +882,8 @@ private:
     ref<Texture> m_clearcoat;
     ref<Texture> m_clearcoat_gloss;
     ref<Texture> m_metallic;
-    Float m_eta;
-    Float m_specular;
+    ref<Texture> m_eta;
+    ref<Texture> m_specular;
     bool m_eta_specular;
 
     /// Sampling rates
