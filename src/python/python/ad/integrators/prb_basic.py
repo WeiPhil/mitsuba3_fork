@@ -196,7 +196,7 @@ class BasicPRBIntegrator(RBIntegrator):
                     if dr.hint(mode == dr.ADMode.Backward, mode='scalar'):
                         dr.backward_from(δL * Lo)
                     else:
-                        δL += dr.forward_to(Lo)
+                        δL += mi.Spectrum(dr.forward_to(Lo))
 
             # ----------- Reorder threads for the next iteration --------
 

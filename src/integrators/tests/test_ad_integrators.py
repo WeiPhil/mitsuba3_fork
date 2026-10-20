@@ -1602,6 +1602,44 @@ def test05_postprocess(variants_all_ad_rgb, integrator_name):
     dr.backward(dr.sum(image.array))
     assert dr.allclose(dr.grad(params[key]), 2 * radiance * pixels)
 
+
+@pytest.mark.parametrize('integrator_name', ['prb', 'prb_basic', 'prb_projective'])
+def test06_forward_spectral(variants_all_ad_spectral, integrator_name):
+    if mi.is_polarized:
+        pytest.skip('Test must be adapted to polarized rendering.')
+
+    scene = mi.load_dict({
+        'type': 'scene',
+        'integrator': {'type': integrator_name, 'max_depth': 2},
+        'emitter': {'type': 'constant', 'radiance': {'type': 'd65', 'scale': 1.0}},
+        'shape': {
+            'type': 'rectangle',
+            'to_world': mi.ScalarTransform4f().scale(10),
+            'bsdf': {'type': 'diffuse', 'reflectance': {'type': 'uniform', 'value': 0.5}},
+        },
+        'sensor': {
+            'type': 'perspective',
+            'to_world': mi.ScalarTransform4f().look_at([0, 0, 1], [0, 0, 0], [0, 1, 0]),
+            'film': {'type': 'hdrfilm', 'width': 2, 'height': 2, 'rfilter': {'type': 'box'}},
+            'sampler': {'type': 'independent', 'sample_count': 4},
+        },
+    })
+    params = mi.traverse(scene)
+    key = 'shape.bsdf.reflectance.value'
+
+    dr.enable_grad(params[key])
+    params.update()
+    image = mi.render(scene, params, seed=0, spp=4)
+    dr.forward(params[key])
+    grad_fwd = dr.sum(dr.grad(image).array)
+
+    dr.set_grad(params[key], 0.0)
+    image = mi.render(scene, params, seed=0, spp=4)
+    dr.backward(dr.sum(image.array))
+    grad_bwd = dr.grad(params[key])
+
+    assert dr.allclose(grad_fwd, grad_bwd, atol=1e-4)
+
 # -------------------------------------------------------------------
 #                      Generate reference images
 # -------------------------------------------------------------------
